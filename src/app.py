@@ -5,9 +5,13 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from enum import Enum
+from uuid import uuid4
+
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import os
 from pathlib import Path
 
@@ -78,6 +82,59 @@ activities = {
 }
 
 
+class Role(str, Enum):
+    student = "student"
+    parent = "parent"
+    provider = "provider"
+    admin = "admin"
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+# In-memory users for this exercise.
+users = {
+    "student1": {
+        "password": "student123",
+        "role": Role.student,
+    },
+    "parent1": {
+        "password": "parent123",
+        "role": Role.parent,
+    },
+    "provider1": {
+        "password": "provider123",
+        "role": Role.provider,
+    },
+    "admin1": {
+        "password": "admin123",
+        "role": Role.admin,
+    },
+}
+
+# token -> user session mapping
+sessions: dict[str, dict] = {}
+
+
+def get_current_user(authorization: str | None):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    token = authorization.replace("Bearer ", "", 1).strip()
+    session = sessions.get(token)
+    if session is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    return session
+
+
+def require_role(user: dict, allowed_roles: set[Role]):
+    if user["role"] not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Forbidden for your role")
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -88,9 +145,48 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def login(payload: LoginRequest):
+    user = users.get(payload.username)
+    if user is None or user["password"] != payload.password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = str(uuid4())
+    sessions[token] = {
+        "username": payload.username,
+        "role": user["role"],
+    }
+
+    return {
+        "token": token,
+        "username": payload.username,
+        "role": user["role"],
+    }
+
+
+@app.post("/auth/logout")
+def logout(authorization: str | None = Header(default=None)):
+    user = get_current_user(authorization)
+    token = authorization.replace("Bearer ", "", 1).strip()
+    sessions.pop(token, None)
+    return {"message": f"Logged out {user['username']}"}
+
+
+@app.get("/auth/me")
+def me(authorization: str | None = Header(default=None)):
+    return get_current_user(authorization)
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    authorization: str | None = Header(default=None),
+):
     """Sign up a student for an activity"""
+    user = get_current_user(authorization)
+    require_role(user, {Role.parent, Role.provider, Role.admin})
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +207,15 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    authorization: str | None = Header(default=None),
+):
     """Unregister a student from an activity"""
+    user = get_current_user(authorization)
+    require_role(user, {Role.provider, Role.admin})
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
